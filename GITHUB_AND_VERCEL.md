@@ -45,3 +45,4 @@ Optional later (partner APIs — see `SETUP_REQUIRED.md`): `OBI_*`, `UBER_*`, `L
 - Keyless live estimates work without Uber/Lyft API keys (OSRM + published rate cards).
 - Do **not** upload `.env.local` to GitHub; use Vercel env settings.
 - `/admin` is gated when `RIDELENS_ADMIN_SECRET` is set (`/admin?secret=…`).
+- There is **no** `postinstall` Playwright step — Vercel only needs `next build`.
