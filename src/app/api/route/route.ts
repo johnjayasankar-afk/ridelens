@@ -1,47 +1,56 @@
-import { NextRequest, NextResponse } from "next/server";
-import { fetchDrivingRoute } from "@/lib/routing/osrm";
-import { rateLimit, rateLimitKey } from "@/lib/quotes/rate-limit";
-import { z } from "zod";
+/**
+ * POST /api/route — road geometry for the map.
+ *
+ * Separate from the quote stream on purpose: the map is decoration relative to
+ * the prices, and a slow map service must never delay a fare. The client
+ * requests it after results are already on screen.
+ */
+import { NextResponse } from 'next/server';
+import { z } from 'zod';
+import { fetchRouteGeometry } from '@/location/routing';
+import { apiError, withErrorEnvelope } from '../_lib/errors';
+import { enforceRateLimit } from '../_lib/request';
 
-export const dynamic = "force-dynamic";
+export const dynamic = 'force-dynamic';
 
-const schema = z.object({
-  fromLat: z.coerce.number().min(-90).max(90),
-  fromLng: z.coerce.number().min(-180).max(180),
-  toLat: z.coerce.number().min(-90).max(90),
-  toLng: z.coerce.number().min(-180).max(180),
+const Point = z.object({
+  lat: z.number().min(-90).max(90),
+  lng: z.number().min(-180).max(180),
 });
+const Schema = z.object({ pickup: Point, destination: Point });
 
-export async function GET(req: NextRequest) {
-  const ip =
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  const rl = rateLimit(rateLimitKey({ ip, action: "route" }), 60, 60);
-  if (!rl.allowed) {
-    return NextResponse.json({ error: "Rate limited" }, { status: 429 });
+export const POST = withErrorEnvelope('POST /api/route', async (req) => {
+  const limit = await enforceRateLimit(req, 'route');
+  if (!limit.ok) return limit.response;
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return apiError(400, 'BAD_REQUEST', 'Body must be JSON.');
   }
+  const parsed = Schema.safeParse(body);
+  if (!parsed.success) return apiError(400, 'BAD_REQUEST', 'Invalid coordinates.');
 
-  const parsed = schema.safeParse(
-    Object.fromEntries(req.nextUrl.searchParams.entries()),
-  );
-  if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid coordinates" }, { status: 400 });
-  }
-
-  const { fromLat, fromLng, toLat, toLng } = parsed.data;
-  const route = await fetchDrivingRoute(
-    { lat: fromLat, lng: fromLng },
-    { lat: toLat, lng: toLng },
-  );
-
-  return NextResponse.json({
-    route: {
-      meters: route.meters,
-      seconds: route.seconds,
-      miles: Math.round(route.miles * 10) / 10,
-      minutes: Math.round(route.minutes),
-      via: route.via,
-      geometry: route.geometry,
-      bbox: route.bbox,
-    },
+  const stub = (p: z.infer<typeof Point>) => ({
+    ...p,
+    formattedAddress: '',
+    placeId: null,
+    name: '',
+    city: null,
+    region: null,
+    country: null,
+    geocoder: 'client',
   });
-}
+
+  const geometry = await fetchRouteGeometry(
+    stub(parsed.data.pickup),
+    stub(parsed.data.destination),
+    req.signal,
+  );
+
+  return NextResponse.json(
+    { geometry },
+    { headers: { ...limit.headers, 'Cache-Control': 'no-store' } },
+  );
+});

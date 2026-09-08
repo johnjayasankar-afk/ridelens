@@ -1,127 +1,81 @@
-import { NextRequest, NextResponse } from "next/server";
-import { canonicalizeRoute } from "@/lib/location/geocoder";
-import {
-  incrementComparisonCount,
-  runQuoteSession,
-  type SourceProgressEvent,
-} from "@/lib/quotes/orchestrator";
-import { rateLimit, rateLimitKey } from "@/lib/quotes/rate-limit";
-import { compareRequestSchema } from "@/lib/validation/schemas";
-import { assertNoSilentMocks } from "@/lib/config";
+/**
+ * POST /api/quotes — run one comparison and return the settled session.
+ *
+ * Non-streaming path, used by tests and by clients that prefer a single
+ * response. The streaming path is /api/quotes/stream.
+ */
+import { NextResponse } from 'next/server';
+import { getConfig } from '@/config/env';
+import { getRepository, persistInBackground } from '@/db/repository';
+import { canonicalizeRoute, RouteError } from '@/location/canonical';
+import { CompareRequestSchema } from '../_lib/schemas';
 
-export const dynamic = "force-dynamic";
+export { CompareRequestSchema };
+import { runQuoteSession } from '@/orchestration/engine';
+import { enabledSources } from '@/sources/registry';
+import { apiError, withErrorEnvelope } from '../_lib/errors';
+import { enforceRateLimit } from '../_lib/request';
 
-function clientIp(req: NextRequest): string {
-  return (
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    req.headers.get("x-real-ip") ||
-    "unknown"
-  );
-}
+export const dynamic = 'force-dynamic';
 
-export async function POST(req: NextRequest) {
-  try {
-    assertNoSilentMocks();
-  } catch (e) {
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : "Invalid config" },
-      { status: 500 },
-    );
-  }
+/*
+ * The orchestrator budgets QUOTE_REQUEST_TIMEOUT_MS (8s by default) for
+ * upstream calls and enforces its own deadline. Serverless platforms default
+ * to around ten seconds, which would kill a slow-but-succeeding comparison a
+ * moment before it answered. Thirty leaves room for the deadline to do its job
+ * and report what arrived.
+ */
+export const maxDuration = 30;
 
-  const ip = clientIp(req);
-  const rl = rateLimit(rateLimitKey({ ip, action: "compare" }));
-  if (!rl.allowed) {
-    return NextResponse.json(
-      { error: "Rate limit exceeded", retryAfterSeconds: rl.retryAfterSeconds },
-      { status: 429, headers: { "Retry-After": String(rl.retryAfterSeconds) } },
-    );
-  }
+export const POST = withErrorEnvelope('POST /api/quotes', async (req) => {
+  const limit = await enforceRateLimit(req, 'compare');
+  if (!limit.ok) return limit.response;
 
   let body: unknown;
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    return apiError(400, 'BAD_REQUEST', 'Body must be JSON.');
   }
 
-  const parsed = compareRequestSchema.safeParse(body);
+  const parsed = CompareRequestSchema.safeParse(body);
   if (!parsed.success) {
-    return NextResponse.json(
-      { error: "Invalid request", details: parsed.error.flatten() },
-      { status: 400 },
+    return apiError(400, 'BAD_REQUEST', parsed.error.issues[0]?.message ?? 'Invalid request.');
+  }
+
+  const cfg = getConfig();
+
+  if (enabledSources().length === 0) {
+    // Explicit and honest: no source means no prices, not empty cards.
+    return apiError(
+      503,
+      'NO_SOURCE_CONFIGURED',
+      'No quote source is currently enabled, so RideLens cannot show live prices. See /api/health for the exact blocker.',
+      limit.headers,
     );
   }
-
-  const wantStream = parsed.data.stream === true;
-  const refresh = parsed.data.refresh === true;
 
   let route;
   try {
-    route = await canonicalizeRoute({
-      pickup: parsed.data.pickup,
-      destination: parsed.data.destination,
-    });
-  } catch (e) {
-    return NextResponse.json(
-      {
-        error: "Location resolution failed",
-        message: e instanceof Error ? e.message : "geocode error",
-      },
-      { status: 422 },
-    );
+    route = await canonicalizeRoute(parsed.data.pickup, parsed.data.destination);
+  } catch (err) {
+    if (err instanceof RouteError) return apiError(422, err.code, err.message);
+    return apiError(502, 'GEOCODER_UNAVAILABLE', 'Could not resolve those locations right now.');
   }
 
-  incrementComparisonCount();
-
-  if (!wantStream) {
-    const session = await runQuoteSession({
-      pickup: route.pickup,
-      destination: route.destination,
-      rankingMode: parsed.data.rankingMode,
-      categoryFilter: parsed.data.categoryFilter,
-      skipCache: refresh,
-    });
-    return NextResponse.json({ session });
-  }
-
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (event: SourceProgressEvent) => {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
-        );
-      };
-      try {
-        await runQuoteSession({
-          pickup: route.pickup,
-          destination: route.destination,
-          rankingMode: parsed.data.rankingMode,
-          categoryFilter: parsed.data.categoryFilter,
-          skipCache: refresh,
-          onEvent: send,
-        });
-      } catch (e) {
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({
-              type: "error",
-              message: e instanceof Error ? e.message : "stream failed",
-            })}\n\n`,
-          ),
-        );
-      } finally {
-        controller.close();
-      }
-    },
+  const session = await runQuoteSession({
+    pickup: route.pickup,
+    destination: route.destination,
+    locale: parsed.data.locale ?? 'en-US',
+    partySize: parsed.data.partySize ?? 1,
+    departAt: parsed.data.departAt ? new Date(parsed.data.departAt) : undefined,
+    timeoutMs: cfg.QUOTE_REQUEST_TIMEOUT_MS,
+    forceRefresh: parsed.data.refresh === true,
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-    },
+  persistInBackground(() => getRepository().saveSession(session, {}), 'saveSession');
+
+  return NextResponse.json(session, {
+    headers: { ...limit.headers, 'Cache-Control': 'no-store' },
   });
-}
+});
